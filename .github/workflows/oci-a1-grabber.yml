@@ -140,11 +140,13 @@ jobs:
               exit 0
             fi
 
-            if grep -qiE "Out of host capacity|InternalError|500|TooManyRequests|429|LimitExceeded.*capacity" err.log; then
-              echo "   ⏳ het cho / throttle — nghi ${RETRY_SEC}s..."
+            # Retry: capacity + throttle + lỗi MẠNG/timeout tạm thời (5xx, connection)
+            if grep -qiE "Out of host capacity|InternalError|500|502|503|504|TooManyRequests|429|LimitExceeded.*capacity|timed out|timeout|ConnectionError|RequestException|Could not connect|Max retries|ServiceError|EndpointConnection|ReadTimeout|ConnectTimeout" err.log; then
+              echo "   ⏳ het cho / throttle / timeout mang — nghi ${RETRY_SEC}s..."
               sleep "$RETRY_SEC"
             else
-              echo "❌ Loi KHAC (khong phai capacity) — dung:"
+              # Chỉ dừng khi lỗi cấu hình thật (auth sai, OCID sai...) — retry vô ích
+              echo "❌ Loi cau hinh (khong phai capacity/mang) — dung de sua:"
               cat err.log || true
               exit 1
             fi

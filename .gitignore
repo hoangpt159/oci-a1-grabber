@@ -1,0 +1,7 @@
+# KHÔNG commit bất cứ file credential/key nào vào repo public
+oc_key.txt
+*.pem
+*.key
+key.pub
+.env
+config
