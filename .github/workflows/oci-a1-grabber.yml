@@ -1,0 +1,151 @@
+name: OCI A1 capacity grabber
+
+# Tự retry tạo Oracle ARM A1.Flex (Always Free) tới khi có capacity — HANDS-OFF.
+# Mỗi job loop thử mỗi 60s trong ~50 phút, rồi TỰ khởi động job kế tiếp (zero-gap).
+# Cron chỉ là lưới an toàn phòng job chết. Repo PUBLIC = Actions miễn phí vô hạn.
+#
+# Chiếm được chỗ → tạo VM "warbazaar" → ping Slack kèm Public IP → dừng chuỗi.
+# Job sau tự no-op (instance đã tồn tại → bỏ qua).
+#
+# SETUP 1 LẦN — repo → Settings → Secrets and variables → Actions → New secret:
+#     OCI_CLI_USER         user OCID        (ocid1.user.oc1..)
+#     OCI_CLI_TENANCY      tenancy OCID     (ocid1.tenancy.oc1..)
+#     OCI_CLI_FINGERPRINT  fingerprint API key
+#     OCI_CLI_KEY_CONTENT  nội dung private key .pem (cả -----BEGIN/END-----)
+#     OCI_CLI_REGION       ap-singapore-1
+#     SSH_PUB_KEY          public key (ssh-ed25519 AAAA... )
+#     SLACK_BOT_TOKEN      xoxb-... (bot phải ở trong channel)
+#     SLACK_NOTIFY_CHANNEL channel ID (vd C0123ABCD)
+#
+# Sau khi VM tạo xong: Actions → workflow → ⋯ → Disable workflow (hoặc xoá repo).
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"    # LƯỚI AN TOÀN: phòng job chết bất ngờ (concurrency chặn chồng)
+  workflow_dispatch: {}        # nút "Run workflow" chạy tay
+
+concurrency:
+  group: oci-a1-grabber
+  cancel-in-progress: false    # job đang chạy thì lần trigger mới chờ, không hủy
+
+permissions:
+  contents: read
+  actions: write               # tự re-dispatch job kế tiếp (zero-gap)
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      SSH_PUB_KEY: ${{ secrets.SSH_PUB_KEY }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_NOTIFY_CHANNEL: ${{ secrets.SLACK_NOTIFY_CHANNEL }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Cấu hình shape — sửa nếu muốn full 4/24
+      OCPUS: "1"
+      MEM_GB: "6"
+      BOOT_GB: "100"
+      DISPLAY_NAME: "warbazaar"
+      LOOP_MAX_SEC: "3000"     # 50 phút mỗi job
+      RETRY_SEC: "60"          # thử lại mỗi 60s
+    steps:
+      - name: Install OCI CLI
+        run: |
+          curl -L -o install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+          bash install.sh --accept-all-defaults
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Retry launch (loop 60s) + notify Slack on success
+        run: |
+          set -uo pipefail
+          C="$OCI_CLI_TENANCY"
+
+          # ── 1) Đã có instance "warbazaar" (chưa terminated)? → dừng, không tạo trùng ──
+          EXIST=$(oci compute instance list -c "$C" \
+              --query "data[?\"display-name\"=='${DISPLAY_NAME}' && \"lifecycle-state\"!='TERMINATED'] | length(@)" \
+              --raw-output 2>/dev/null || echo 0)
+          if [ "${EXIST:-0}" != "0" ]; then
+            echo "✅ Da co instance '${DISPLAY_NAME}' — bo qua (khong notify lai)."
+            exit 0
+          fi
+
+          # ── 2) Auto-dò AD / subnet / image (1 lần) ──
+          AD=$(oci iam availability-domain list -c "$C" --query 'data[0].name' --raw-output)
+          SUBNET=$(oci network subnet list -c "$C" \
+              --query 'data[?"prohibit-public-ip-on-vnic"==`false`].id | [0]' --raw-output 2>/dev/null || true)
+          IMAGE=""
+          for v in "24.04 Minimal aarch64" "24.04"; do
+            IMAGE=$(oci compute image list -c "$C" \
+                --operating-system "Canonical Ubuntu" --operating-system-version "$v" \
+                --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED --sort-order DESC \
+                --query 'data[0].id' --raw-output 2>/dev/null || true)
+            [ -n "$IMAGE" ] && [ "$IMAGE" != "null" ] && break
+          done
+          echo "AD=$AD"; echo "SUBNET=$SUBNET"; echo "IMAGE=$IMAGE"
+          [ -z "${SUBNET:-}" ] && { echo "❌ Khong tim thay public subnet (tao VCN warbazaar-vcn chua?)"; exit 1; }
+          [ -z "${IMAGE:-}" ] && { echo "❌ Khong tim thay image"; exit 1; }
+
+          echo "$SSH_PUB_KEY" > key.pub
+
+          # ── 3) Loop thử mỗi 60s trong LOOP_MAX_SEC, hết giờ tự re-dispatch ──
+          START=$(date +%s)
+          ATTEMPT=0
+          while true; do
+            ATTEMPT=$((ATTEMPT+1))
+            NOW=$(date +%s)
+            if [ $((NOW-START)) -ge "$LOOP_MAX_SEC" ]; then
+              echo "⏱️  Het ${LOOP_MAX_SEC}s ($ATTEMPT lan) — tu khoi dong job ke tiep (zero-gap)."
+              curl -s -X POST \
+                -H "Authorization: token ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/oci-a1-grabber.yml/dispatches" \
+                -d '{"ref": "main"}' \
+                && echo "🔁 Da re-dispatch job ke tiep." || echo "(re-dispatch loi — cron luoi an toan se lo)"
+              exit 0
+            fi
+            echo "[$(date '+%H:%M:%S')] thu #$ATTEMPT ..."
+            if oci compute instance launch \
+                  --availability-domain "$AD" -c "$C" \
+                  --shape "VM.Standard.A1.Flex" \
+                  --shape-config "{\"ocpus\": ${OCPUS}, \"memoryInGBs\": ${MEM_GB}}" \
+                  --image-id "$IMAGE" --subnet-id "$SUBNET" \
+                  --boot-volume-size-in-gbs "$BOOT_GB" \
+                  --assign-public-ip true --display-name "$DISPLAY_NAME" \
+                  --ssh-authorized-keys-file key.pub \
+                  --wait-for-state RUNNING 2>err.log; then
+              echo "✅✅ TAO THANH CONG sau $ATTEMPT lan!"
+
+              sleep 5
+              IID=$(oci compute instance list -c "$C" \
+                  --query "data[?\"display-name\"=='${DISPLAY_NAME}' && \"lifecycle-state\"=='RUNNING'].id | [0]" \
+                  --raw-output 2>/dev/null || true)
+              PUBIP=$(oci compute instance list-vnics --instance-id "$IID" \
+                  --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "xem trong Console")
+              echo "PUBLIC_IP = $PUBIP"
+
+              MSG="✅ VM *warbazaar* (ARM A1 ${OCPUS}OCPU/${MEM_GB}GB) đã tạo xong. Public IP: ${PUBIP}. SSH: ssh ubuntu@${PUBIP}"
+              if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_NOTIFY_CHANNEL:-}" ]; then
+                curl -s -X POST https://slack.com/api/chat.postMessage \
+                  -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+                  -H "Content-type: application/json; charset=utf-8" \
+                  -d "{\"channel\": \"${SLACK_NOTIFY_CHANNEL}\", \"text\": \"${MSG}\"}" \
+                  >/dev/null && echo "💬 Da ping Slack." || echo "(khong ping duoc Slack)"
+              fi
+
+              exit 0
+            fi
+
+            if grep -qiE "Out of host capacity|InternalError|500|TooManyRequests|429|LimitExceeded.*capacity" err.log; then
+              echo "   ⏳ het cho / throttle — nghi ${RETRY_SEC}s..."
+              sleep "$RETRY_SEC"
+            else
+              echo "❌ Loi KHAC (khong phai capacity) — dung:"
+              cat err.log || true
+              exit 1
+            fi
+          done
