@@ -109,6 +109,8 @@ jobs:
               exit 0
             fi
             echo "[$(date '+%H:%M:%S')] thu #$ATTEMPT ..."
+            # --no-retry: tắt retry nội bộ CLI (fail nhanh khi het cho) → nhịp đều ~60s
+            # timeout ngắn: tránh 1 lần thử treo lâu vì network stall
             if oci compute instance launch \
                   --availability-domain "$AD" -c "$C" \
                   --shape "VM.Standard.A1.Flex" \
@@ -117,6 +119,7 @@ jobs:
                   --boot-volume-size-in-gbs "$BOOT_GB" \
                   --assign-public-ip true --display-name "$DISPLAY_NAME" \
                   --ssh-authorized-keys-file key.pub \
+                  --no-retry --connection-timeout 20 --read-timeout 45 \
                   --wait-for-state RUNNING 2>err.log; then
               echo "✅✅ TAO THANH CONG sau $ATTEMPT lan!"
 
