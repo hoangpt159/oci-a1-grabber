@@ -46,7 +46,7 @@ jobs:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
       SLACK_NOTIFY_CHANNEL: ${{ secrets.SLACK_NOTIFY_CHANNEL }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Cấu hình shape — sửa nếu muốn full 4/24
+      # Cấu hình shape — sửa nếu muốn full free 2/12 (Oracle cắt 4/24→2/12 từ 15/06/2026)
       OCPUS: "1"
       MEM_GB: "6"
       BOOT_GB: "100"
